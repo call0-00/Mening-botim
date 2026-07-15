@@ -1,10 +1,11 @@
 """
-AI Telegram Bot - matn va rasmlarga javob beradi (Claude AI orqali)
+AI Telegram Bot - Google Gemini orqali matn va rasmlarga javob beradi
 """
 
 import os
 import base64
 import logging
+import requests
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -13,10 +14,14 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
-from anthropic import Anthropic
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+
+GEMINI_URL = (
+    "https://generativelanguage.googleapis.com/v1beta/models/"
+    "gemini-2.5-flash:generateContent?key=" + GEMINI_API_KEY
+)
 
 SYSTEM_PROMPT = (
     "Sen do'stona, yordamchi va bilimli Telegram botsan. "
@@ -34,8 +39,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-client = Anthropic(api_key=ANTHROPIC_API_KEY)
-
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -50,23 +53,24 @@ async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Suhbat tarixi tozalandi")
 
 
-def call_claude(chat_id, content):
-    """content - user xabarining kontenti (matn yoki matn+rasm ro'yxati)"""
+def call_gemini(chat_id, parts):
+    """parts - Gemini uchun kontent qismlari (matn va/yoki rasm)"""
     history = chat_history.get(chat_id, [])
-    history.append({"role": "user", "content": content})
+    history.append({"role": "user", "parts": parts})
     history = history[-MAX_HISTORY:]
 
-    response = client.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=1024,
-        system=SYSTEM_PROMPT,
-        messages=history,
-    )
-    ai_reply = "".join(
-        block.text for block in response.content if block.type == "text"
-    ).strip()
+    payload = {
+        "contents": history,
+        "systemInstruction": {"parts": [{"text": SYSTEM_PROMPT}]},
+    }
 
-    history.append({"role": "assistant", "content": ai_reply})
+    resp = requests.post(GEMINI_URL, json=payload, timeout=60)
+    resp.raise_for_status()
+    data = resp.json()
+
+    ai_reply = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+
+    history.append({"role": "model", "parts": [{"text": ai_reply}]})
     chat_history[chat_id] = history[-MAX_HISTORY:]
     return ai_reply
 
@@ -78,7 +82,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_chat_action(chat_id=chat_id, action="typing")
 
     try:
-        ai_reply = call_claude(chat_id, user_text)
+        ai_reply = call_gemini(chat_id, [{"text": user_text}])
     except Exception as e:
         logger.error(f"AI xatosi: {e}")
         ai_reply = f"Xatolik yuz berdi: {e}"
@@ -93,25 +97,17 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_chat_action(chat_id=chat_id, action="typing")
 
     try:
-        # Eng katta o'lchamdagi rasmni olamiz
         photo = update.message.photo[-1]
         file = await context.bot.get_file(photo.file_id)
         photo_bytes = await file.download_as_bytearray()
         image_b64 = base64.b64encode(bytes(photo_bytes)).decode("utf-8")
 
-        content = [
-            {
-                "type": "image",
-                "source": {
-                    "type": "base64",
-                    "media_type": "image/jpeg",
-                    "data": image_b64,
-                },
-            },
-            {"type": "text", "text": caption},
+        parts = [
+            {"inline_data": {"mime_type": "image/jpeg", "data": image_b64}},
+            {"text": caption},
         ]
 
-        ai_reply = call_claude(chat_id, content)
+        ai_reply = call_gemini(chat_id, parts)
     except Exception as e:
         logger.error(f"Rasm tahlil xatosi: {e}")
         ai_reply = f"Rasmni tahlil qilishda xatolik: {e}"
@@ -120,9 +116,9 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def main():
-    if not TELEGRAM_TOKEN or not ANTHROPIC_API_KEY:
+    if not TELEGRAM_TOKEN or not GEMINI_API_KEY:
         raise RuntimeError(
-            "TELEGRAM_TOKEN va ANTHROPIC_API_KEY muhit o'zgaruvchilarini sozlang!"
+            "TELEGRAM_TOKEN va GEMINI_API_KEY muhit o'zgaruvchilarini sozlang!"
         )
 
     app = Application.builder().token(TELEGRAM_TOKEN).build()
@@ -138,3 +134,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
